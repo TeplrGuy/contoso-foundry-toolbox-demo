@@ -386,11 +386,13 @@ azd deploy
 
 ### Operational notes
 
-- **Cold start exceeds the gateway timeout.** The plan scales to zero and drains
-  right after each run, so the first POST after idle or after `azd deploy` returns
-  **504 at ~240 s** while the run itself still completes server-side. Warm the host
-  with a cheap `GET /agents/{name}/` first; both measured runs then completed in
-  7–15 s. For a live demo, pre-warm or configure always-ready instances.
+- **The playground uses an always-ready HTTP instance.** The agent's previous
+  Flex Consumption configuration scaled to zero, and a cold start could exceed
+  the ~240-second HTTP gateway timeout. Browsers surfaced that timeout as a
+  generic network error. `infra/app/api.bicep` now configures one always-ready
+  `http` instance so the built-in `/agents/{name}/` playground can establish its
+  `/chatstream` response without a manual warm-up. Always-ready capacity incurs
+  standing Flex Consumption charges while configured.
 - **Deployment requirement.** The sample's `src/requirements.txt` ships an editable
   install (`-e ../../..[monitor]`) that Oryx cannot build. It is pinned to
   `azurefunctions-agents-runtime[monitor]==0.1.0b16`, the exact version of the

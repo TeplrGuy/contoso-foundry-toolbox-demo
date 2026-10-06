@@ -1,0 +1,32 @@
+{
+  "verified_at": "2026-10-06T13:10:00Z",
+  "function_app": "func-agent-func-hbcyongnalrgq",
+  "agent": "study_assistant",
+  "playground_url": "https://func-agent-func-hbcyongnalrgq.azurewebsites.net/agents/study_assistant/",
+  "stream_path": "/agents/study_assistant/chatstream",
+  "authentication": {
+    "method": "Function host key in the code query parameter",
+    "key_recorded": false
+  },
+  "flex_scale_configuration": {
+    "alwaysReady": [
+      {
+        "name": "http",
+        "instanceCount": 1
+      }
+    ],
+    "instanceMemoryMB": 2048,
+    "maximumInstanceCount": 100
+  },
+  "first_post_deployment_stream": {
+    "http_status": 200,
+    "elapsed_seconds": 21.68,
+    "content_type": "text/event-stream",
+    "session_event": true,
+    "tool_start": "study-doc-search",
+    "tool_end": true,
+    "done_event": true,
+    "contains_canary": true,
+    "canary": "PD-CANARY-4419"
+  }
+}
