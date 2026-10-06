@@ -12,21 +12,39 @@
     "alwaysReady": [
       {
         "name": "http",
-        "instanceCount": 1
+        "instanceCount": 2
       }
     ],
     "instanceMemoryMB": 2048,
-    "maximumInstanceCount": 100
+    "maximumInstanceCount": 100,
+    "httpPerInstanceConcurrency": 1
   },
-  "first_post_deployment_stream": {
-    "http_status": 200,
-    "elapsed_seconds": 21.68,
-    "content_type": "text/event-stream",
-    "session_event": true,
-    "tool_start": "study-doc-search",
-    "tool_end": true,
-    "done_event": true,
-    "contains_canary": true,
+  "idle_browser_flows": {
+    "idle_seconds": 180,
+    "study_assistant": {
+      "page_http_status": 200,
+      "page_elapsed_seconds": 0.28,
+      "stream_http_status": 200,
+      "stream_elapsed_seconds": 15.88,
+      "content_type": "text/event-stream",
+      "session_event": true,
+      "tool_start": "study-doc-search",
+      "tool_end": true,
+      "done_event": true,
+      "contains_canary": true
+    },
+    "study_assistant_flat": {
+      "page_http_status": 200,
+      "page_elapsed_seconds": 0.19,
+      "stream_http_status": 200,
+      "stream_elapsed_seconds": 8.13,
+      "content_type": "text/event-stream",
+      "session_event": true,
+      "tool_start": "study-doc-search",
+      "tool_end": true,
+      "done_event": true,
+      "contains_canary": true
+    },
     "canary": "PD-CANARY-4419"
   }
 }

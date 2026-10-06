@@ -12,7 +12,9 @@ param deploymentStorageContainerName string
 param instanceMemoryMB int = 2048
 param maximumInstanceCount int = 100
 @minValue(1)
-param alwaysReadyHttpInstanceCount int = 1
+param alwaysReadyHttpInstanceCount int = 2
+@minValue(1)
+param httpPerInstanceConcurrency int = 1
 param identityId string = ''
 param identityClientId string = ''
 
@@ -72,6 +74,11 @@ module api 'br/public:avm/res/web/site:0.15.1' = {
         ]
         instanceMemoryMB: instanceMemoryMB
         maximumInstanceCount: maximumInstanceCount
+        triggers: {
+          http: {
+            perInstanceConcurrency: httpPerInstanceConcurrency
+          }
+        }
       }
       runtime: {
         name: runtimeName

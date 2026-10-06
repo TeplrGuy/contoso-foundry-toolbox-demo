@@ -386,13 +386,15 @@ azd deploy
 
 ### Operational notes
 
-- **The playground uses an always-ready HTTP instance.** The agent's previous
+- **The playground uses two always-ready HTTP instances.** The agent's previous
   Flex Consumption configuration scaled to zero, and a cold start could exceed
   the ~240-second HTTP gateway timeout. Browsers surfaced that timeout as a
-  generic network error. `infra/app/api.bicep` now configures one always-ready
-  `http` instance so the built-in `/agents/{name}/` playground can establish its
-  `/chatstream` response without a manual warm-up. Always-ready capacity incurs
-  standing Flex Consumption charges while configured.
+  generic network error. A single always-ready instance was also insufficient
+  because a toolbox inventory request calls back into this same Function App's
+  MCP endpoint while the browser stream is open. `infra/app/api.bicep` now
+  configures two always-ready `http` instances and HTTP concurrency of one per
+  instance, isolating the playground stream from that MCP callback. Always-ready
+  capacity incurs standing Flex Consumption charges while configured.
 - **Deployment requirement.** The sample's `src/requirements.txt` ships an editable
   install (`-e ../../..[monitor]`) that Oryx cannot build. It is pinned to
   `azurefunctions-agents-runtime[monitor]==0.1.0b16`, the exact version of the
