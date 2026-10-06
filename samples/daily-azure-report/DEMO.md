@@ -228,6 +228,20 @@ flat:         https://func-agent-func-hbcyongnalrgq.azurewebsites.net/agents/stu
 Chat API is `POST .../agents/{name}/chat` with body `{"prompt": "..."}` and a
 function key header. Both endpoints use function-level auth; no keys are printed here.
 
+For the built-in Function playground, open one of the chat URLs above, select
+the gear icon, and use:
+
+```text
+Base URL:    https://func-agent-func-hbcyongnalrgq.azurewebsites.net
+Function key: <a current host/function key, with no quotes or surrounding spaces>
+```
+
+The Base URL must be the Function App origin only. Do **not** paste the full
+`/agents/study_assistant/` URL into the Base URL field; the playground appends
+the agent route and `/chatstream` itself. The key is sent as the URL-encoded
+`code` query parameter. A master key works, but a scoped host/function key is
+preferred for presentation use.
+
 Role grant (step 7): the function's user-assigned identity holds **Foundry User**
 on the project so it can call the toolbox. In this tenant the roles are named
 **Foundry User** / **Foundry Project Manager** — not "Azure AI User". RBAC took
