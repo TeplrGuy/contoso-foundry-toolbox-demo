@@ -1,0 +1,343 @@
+"""Merge global and agent config into resolved runtime configuration."""
+
+from __future__ import annotations
+
+from azure_functions_agents._slug import _function_name_from_source
+from azure_functions_agents.config.env import runtime_env_value
+from azure_functions_agents.config.schema import (
+    AgentConfiguration,
+    AgentFrameworkCompactionConfig,
+    AgentFrameworkConfiguration,
+    AgentSpec,
+    BuiltinEndpointsConfig,
+    DynamicSessionsCodeInterpreterConfig,
+    GlobalConfig,
+    McpFilter,
+    ResolvedAgent,
+    SkillsFilter,
+    SubagentRef,
+    ToolsFilter,
+    WebRequestConfig,
+)
+
+DEFAULT_TIMEOUT = 900.0
+
+_AGENT_CONFIGURATION_FIELD = "agent_configuration"
+_AGENT_FRAMEWORK_FIELD = "agent_framework"
+_COMPACTION_FIELD = "compaction"
+_MAX_CONTEXT_WINDOW_TOKENS_FIELD = "max_context_window_tokens"
+_MAX_OUTPUT_TOKENS_FIELD = "max_output_tokens"
+_MAX_CONTEXT_WINDOW_TOKENS_PATH = (
+    f"{_AGENT_CONFIGURATION_FIELD}.{_AGENT_FRAMEWORK_FIELD}."
+    f"{_COMPACTION_FIELD}.{_MAX_CONTEXT_WINDOW_TOKENS_FIELD}"
+)
+
+
+def _resolve_builtin_endpoints(
+    spec: AgentSpec, global_config: GlobalConfig
+) -> BuiltinEndpointsConfig:
+    builtin_endpoints = spec.builtin_endpoints
+    if isinstance(builtin_endpoints, BuiltinEndpointsConfig):
+        resolved = builtin_endpoints
+    elif builtin_endpoints is True:
+        resolved = BuiltinEndpointsConfig(debug_chat_ui=True, chat_api=True, mcp=True)
+    else:
+        resolved = BuiltinEndpointsConfig(debug_chat_ui=False, chat_api=False, mcp=False)
+
+    # Inherit the app-wide auth default (agents.config.yaml `http_auth`) unless the
+    # agent authored its own builtin_endpoints.http_auth, which always overrides.
+    authored_http_auth = (
+        isinstance(builtin_endpoints, BuiltinEndpointsConfig)
+        and "http_auth" in builtin_endpoints.model_fields_set
+    )
+    if not authored_http_auth and global_config.http_auth is not None:
+        resolved = resolved.model_copy(update={"http_auth": global_config.http_auth})
+    return resolved
+
+
+def _resolve_model(spec: AgentSpec, global_config: GlobalConfig) -> str | None:
+    env_model = runtime_env_value("AZURE_FUNCTIONS_AGENTS_MODEL")
+    return spec.model or global_config.model or env_model or None
+
+
+def _resolve_timeout(spec: AgentSpec, global_config: GlobalConfig) -> float:
+    if spec.timeout is not None:
+        return spec.timeout
+    if global_config.timeout is not None:
+        return global_config.timeout
+    env_timeout = runtime_env_value("AZURE_FUNCTIONS_AGENTS_TIMEOUT_SECONDS")
+    if env_timeout:
+        try:
+            return float(env_timeout)
+        except ValueError:
+            pass
+    return DEFAULT_TIMEOUT
+
+
+def _resolve_sandbox(
+    spec: AgentSpec, global_config: GlobalConfig
+) -> DynamicSessionsCodeInterpreterConfig | None:
+    if spec.system_tools and spec.system_tools.dynamic_sessions_code_interpreter is False:
+        return None
+    if global_config.system_tools:
+        return global_config.system_tools.dynamic_sessions_code_interpreter
+    return None
+
+
+def _resolve_web_request(
+    spec: AgentSpec, global_config: GlobalConfig
+) -> WebRequestConfig | None:
+    """Resolve the (default-on) ``web_request`` system tool config.
+
+    Unlike the opt-in sandbox, ``web_request`` is enabled unless explicitly
+    disabled: per-agent ``false`` opts out; global ``false`` disables it
+    app-wide; anything else (absent/``True``/an object) leaves it enabled,
+    using the global object's fields when one is given.
+    """
+    if spec.system_tools and spec.system_tools.web_request is False:
+        return None
+
+    global_value = global_config.system_tools.web_request if global_config.system_tools else None
+    if global_value is False:
+        return None
+    if isinstance(global_value, WebRequestConfig):
+        return global_value
+    return WebRequestConfig()
+
+
+def apply_mcp_filter(
+    global_mcp: list[str], spec_mcp: bool | McpFilter | None
+) -> tuple[list[str], bool]:
+    if spec_mcp is False:
+        return [], True
+    if spec_mcp is None or spec_mcp is True:
+        return list(global_mcp), False
+    excluded_names = set(spec_mcp.exclude)
+    return ([name for name in global_mcp if name not in excluded_names], False)
+
+
+def apply_skills_filter(
+    discovered_skills: list[str], spec_skills: bool | SkillsFilter | None
+) -> tuple[list[str], bool]:
+    if spec_skills is False:
+        return [], True
+    if spec_skills is None or spec_skills is True:
+        return list(discovered_skills), False
+    excluded_names = set(spec_skills.exclude)
+    return ([name for name in discovered_skills if name not in excluded_names], False)
+
+
+def apply_tools_filter(
+    spec_tools: bool | ToolsFilter | None,
+    global_tools_filter: ToolsFilter | None,
+) -> tuple[ToolsFilter, bool]:
+    if spec_tools is False:
+        return ToolsFilter(), True
+    if spec_tools is None or spec_tools is True:
+        if global_tools_filter is not None:
+            return global_tools_filter.model_copy(deep=True), False
+        return ToolsFilter(), False
+
+    merged_excludes = set(spec_tools.exclude)
+    if global_tools_filter is not None:
+        merged_excludes.update(global_tools_filter.exclude)
+    return ToolsFilter(exclude=sorted(merged_excludes)), False
+
+
+def _merge_compaction(
+    agent_config: AgentFrameworkCompactionConfig,
+    global_config: AgentFrameworkCompactionConfig | None,
+) -> AgentFrameworkCompactionConfig | None:
+    max_context_window_tokens = (
+        agent_config.max_context_window_tokens
+        if _MAX_CONTEXT_WINDOW_TOKENS_FIELD in agent_config.model_fields_set
+        else global_config.max_context_window_tokens
+        if global_config is not None
+        else None
+    )
+    if max_context_window_tokens is None:
+        return None
+    return AgentFrameworkCompactionConfig(max_context_window_tokens=max_context_window_tokens)
+
+
+def _merge_agent_framework_configuration(
+    agent_config: AgentFrameworkConfiguration,
+    global_config: AgentFrameworkConfiguration | None,
+) -> AgentFrameworkConfiguration | None:
+    if _COMPACTION_FIELD not in agent_config.model_fields_set:
+        compaction = (
+            global_config.compaction.model_copy(deep=True)
+            if global_config is not None and global_config.compaction is not None
+            else None
+        )
+    elif agent_config.compaction is None:
+        compaction = None
+    else:
+        compaction = _merge_compaction(
+            agent_config.compaction,
+            global_config.compaction if global_config else None,
+        )
+
+    if compaction is None:
+        return None
+    return AgentFrameworkConfiguration(compaction=compaction)
+
+
+def _merge_agent_configuration(
+    agent_config: AgentConfiguration,
+    global_config: AgentConfiguration | None,
+) -> AgentConfiguration:
+    max_output_tokens = (
+        agent_config.max_output_tokens
+        if _MAX_OUTPUT_TOKENS_FIELD in agent_config.model_fields_set
+        else global_config.max_output_tokens
+        if global_config is not None
+        else None
+    )
+
+    if _AGENT_FRAMEWORK_FIELD not in agent_config.model_fields_set:
+        agent_framework = (
+            global_config.agent_framework.model_copy(deep=True)
+            if global_config and global_config.agent_framework
+            else None
+        )
+    elif agent_config.agent_framework is None:
+        agent_framework = None
+    else:
+        agent_framework = _merge_agent_framework_configuration(
+            agent_config.agent_framework,
+            global_config.agent_framework if global_config else None,
+        )
+
+    return AgentConfiguration(
+        max_output_tokens=max_output_tokens,
+        agent_framework=agent_framework,
+    )
+
+
+def _validate_agent_configuration(config: AgentConfiguration) -> None:
+    max_context_window_tokens = (
+        config.agent_framework.compaction.max_context_window_tokens
+        if config.agent_framework is not None and config.agent_framework.compaction is not None
+        else None
+    )
+    if max_context_window_tokens is None:
+        return
+    if config.max_output_tokens is None:
+        raise ValueError(
+            f"{_AGENT_CONFIGURATION_FIELD}.{_MAX_OUTPUT_TOKENS_FIELD} is required when "
+            f"{_MAX_CONTEXT_WINDOW_TOKENS_PATH} is configured"
+        )
+    if config.max_output_tokens >= max_context_window_tokens:
+        raise ValueError(
+            f"{_AGENT_CONFIGURATION_FIELD}.{_MAX_OUTPUT_TOKENS_FIELD} must be less than "
+            f"{_MAX_CONTEXT_WINDOW_TOKENS_PATH}"
+        )
+
+
+def _resolve_agent_configuration(
+    spec: AgentSpec, global_config: GlobalConfig
+) -> AgentConfiguration:
+    """Recursively merge agent overrides over global agent configuration."""
+    if _AGENT_CONFIGURATION_FIELD not in spec.model_fields_set:
+        resolved = (
+            global_config.agent_configuration.model_copy(deep=True)
+            if global_config.agent_configuration is not None
+            else AgentConfiguration()
+        )
+    elif spec.agent_configuration is None:
+        resolved = AgentConfiguration()
+    else:
+        resolved = _merge_agent_configuration(
+            spec.agent_configuration,
+            global_config.agent_configuration,
+        )
+
+    _validate_agent_configuration(resolved)
+    return resolved
+
+
+def _resolve_slug(spec: AgentSpec) -> str:
+    """Compute the agent's stable identity slug from its source file stem.
+
+    This is the same sanitization used for function names and built-in
+    endpoint routes (see ``_slug.py``), so an agent's slug, function name,
+    and ``/agents/<slug>/`` route are always identical. It is also the
+    identifier ``subagents[].agent`` references point at and the suffix of
+    the ``delegate_<slug>`` tool name (FRD 0007 §4.8).
+
+    ``compose()`` must stay warning-free (validation-time concerns belong
+    to ``config.validation``), so a missing ``source_file`` — common for
+    directly-constructed ``AgentSpec``s in unit tests — silently falls
+    back to a sanitized version of ``spec.name`` rather than warning.
+    """
+    return _function_name_from_source(spec.source_file, spec.name, warn_on_missing=False)
+
+
+def _normalize_subagents(spec: AgentSpec) -> list[SubagentRef]:
+    """Copy the spec's ``subagents`` list, defaulting to empty.
+
+    Reference validation (unknown/duplicate/self, tool-name collisions) is
+    intentionally deferred to ``config.validation``, which runs once the
+    full slug index is available; ``compose()`` only normalizes shape.
+    """
+    return [ref.model_copy() for ref in (spec.subagents or [])]
+
+
+def compose(
+    spec: AgentSpec,
+    global_config: GlobalConfig,
+    *,
+    discovered_mcp_names: list[str] | None = None,
+    discovered_skill_names: list[str] | None = None,
+) -> ResolvedAgent:
+    """Top-level merge function called by the app orchestrator."""
+    available_mcp = list(discovered_mcp_names or [])
+    enabled_mcp, mcp_disabled = apply_mcp_filter(available_mcp, spec.mcp)
+
+    skill_pool = list(discovered_skill_names or [])
+    enabled_skills, skills_disabled = apply_skills_filter(skill_pool, spec.skills)
+
+    tool_filter, tools_disabled = apply_tools_filter(spec.tools, global_config.tools)
+
+    metadata = dict(spec.metadata or {})
+    if spec.logger is not None:
+        metadata["logger"] = spec.logger
+    if spec.workflows is not None:
+        metadata["workflows"] = spec.workflows.model_dump(mode="json")
+
+    resolved = ResolvedAgent(
+        name=spec.name,
+        slug=_resolve_slug(spec),
+        description=spec.description,
+        trigger=spec.trigger,
+        instructions=spec.instructions,
+        is_main=spec.is_main,
+        builtin_endpoints=_resolve_builtin_endpoints(spec, global_config),
+        model=_resolve_model(spec, global_config),
+        timeout=_resolve_timeout(spec, global_config),
+        enabled_mcp_names=enabled_mcp,
+        enabled_skills_names=enabled_skills,
+        mcp_exclude_names=list(spec.mcp.exclude) if isinstance(spec.mcp, McpFilter) else [],
+        skills_exclude_names=list(spec.skills.exclude)
+        if isinstance(spec.skills, SkillsFilter)
+        else [],
+        tool_exclude_names=list(tool_filter.exclude),
+        tool_filter=tool_filter,
+        workflows=spec.workflows,
+        subagents=_normalize_subagents(spec),
+        tools_disabled=tools_disabled,
+        skills_disabled=skills_disabled,
+        mcp_disabled=mcp_disabled,
+        sandbox_config=_resolve_sandbox(spec, global_config),
+        web_request_config=_resolve_web_request(spec, global_config),
+        input_schema=spec.input_schema,
+        response_schema=spec.response_schema,
+        response_example=spec.response_example,
+        substitute_variables=spec.substitute_variables,
+        metadata=metadata,
+        source_file=spec.source_file,
+        agent_configuration=_resolve_agent_configuration(spec, global_config),
+    )
+
+    return resolved

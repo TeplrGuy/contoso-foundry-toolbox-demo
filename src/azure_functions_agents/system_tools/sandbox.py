@@ -1,0 +1,475 @@
+"""
+ACA Dynamic Sessions sandbox — execute_python tool.
+
+Provides an ``execute_python`` tool backed by Azure Container Apps dynamic
+sessions (code-interpreter pools). Configured via the
+``dynamic_sessions_code_interpreter`` system tool configuration.
+
+Each agent can have its own session pool endpoint. The ACA session id is
+usually derived from the runtime's ``session_id`` (passed in by the runner via
+``fallback_session_id``) so REPL state — variables, imports, files, browser
+pages — persists across calls within a conversation. When no session id is
+available, a fresh GUID is generated for that tool instance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import urllib.parse
+import uuid
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
+
+import aiohttp
+from azure.identity.aio import get_bearer_token_provider
+from pydantic import BaseModel, Field
+
+from .._credential import build_async_credential, build_async_credential_with_client_id
+from .._function_tool import FunctionTool, tool
+from .._logger import logger
+from .._observability import (
+    ATTR_OPERATION_ID,
+    FaultDomain,
+    LifecycleStage,
+    current_operation_id,
+    record_sandbox_execution,
+    start_span,
+)
+from ..config.env import has_unresolved_placeholders, substitute_env_vars_in_value
+
+if TYPE_CHECKING:
+    from azure.identity.aio import DefaultAzureCredential
+
+_API_VERSION = "2025-10-02-preview"
+
+# The managed-identity bearer token is minted for the Azure Container Apps
+# dynamic sessions audience and must only ever be attached to a genuine dynamic
+# sessions host. Endpoints are restricted to subdomains of ``dynamicsessions.io``
+# so a mis-set app setting cannot redirect the token elsewhere.
+_ALLOWED_SESSIONS_HOST_SUFFIX = ".dynamicsessions.io"
+
+
+def _is_allowed_sessions_endpoint(endpoint: str) -> bool:
+    """Return ``True`` only for https URLs on an ACA dynamic sessions host.
+
+    The resolved endpoint host must be a subdomain of ``dynamicsessions.io``
+    (``*.dynamicsessions.io``). Any non-https scheme, embedded userinfo, empty
+    host, lookalike host, or malformed URL is rejected so the tool (and the
+    managed-identity token it carries) is never bound to an unintended host.
+    """
+    try:
+        parsed = urllib.parse.urlparse(endpoint)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    if "@" in parsed.netloc:
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return host.endswith(_ALLOWED_SESSIONS_HOST_SUFFIX)
+
+
+# ---------------------------------------------------------------------------
+# Playwright helper that is pre-loaded into every sandbox session
+# ---------------------------------------------------------------------------
+
+_ACA_SESSION_SETUP = """
+async def launch_browser(width=1280, height=800):
+    from playwright.async_api import async_playwright
+    p = await async_playwright().start()
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            f'--window-size={width},{height}',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-extensions',
+        ],
+    )
+    context = await browser.new_context(
+        user_agent=(
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/131.0.0.0 Safari/537.36'
+        ),
+        viewport={'width': width, 'height': height},
+    )
+    page = await context.new_page()
+    return page
+"""
+
+# ---------------------------------------------------------------------------
+# Tool description
+# ---------------------------------------------------------------------------
+
+_EXECUTE_PYTHON_DESCRIPTION = (
+    "Execute Python code in a persistent sandboxed REPL backed by a"
+    " Jupyter kernel. Returns JSON with result, stdout, and stderr.\n"
+    "\n"
+    "IMPORTANT: This runs in an ISOLATED SANDBOX with its own file system."
+    "\n"
+    "Only use this tool when you need to actually run code,"
+    " when no other tool can accomplish the task (there's a small cost to using it) —"
+    " computation, data processing, web browsing, etc."
+    " Do NOT call this tool just to print text, format output, or display"
+    " results you already have. Respond directly with text instead.\n"
+    "\n"
+    "Key behaviors:\n"
+    "- State persists across calls: variables, imports, and files"
+    " (/mnt/data/) are retained between invocations.\n"
+    "- The last expression value is returned in 'result' (like a"
+    " Jupyter cell). Use print() for explicit output to 'stdout'.\n"
+    "- Top-level await is supported (Jupyter kernel).\n"
+    "- Playwright is pre-installed for browser automation (see `launch_browser` helper below).\n"
+    "- Shell commands: use subprocess.run(), not '!' syntax.\n"
+    "- Common packages are pre-installed: requests, numpy, pandas, matplotlib,"
+    " scikit-learn, playwright, etc.\n"
+    "\n"
+    "Returning binary data (images, screenshots):\n"
+    "- Generate the data, base64-encode it, and print it to stdout.\n"
+    "- Example for plots:\n"
+    "  import matplotlib; matplotlib.use('Agg')\n"
+    "  import matplotlib.pyplot as plt, base64, io\n"
+    "  fig, ax = plt.subplots()\n"
+    "  ax.plot([1,2,3],[4,5,6])\n"
+    "  buf = io.BytesIO()\n"
+    "  fig.savefig(buf, format='png'); buf.seek(0)\n"
+    "  print(base64.b64encode(buf.read()).decode())\n"
+    "  plt.close()\n"
+    "\n"
+    "Playwright (browser automation):\n"
+    "- ALWAYS use the pre-loaded helper to get a page:\n"
+    "    page = await launch_browser()\n"
+    "  NEVER call async_playwright() or chromium.launch() directly.\n"
+    "  The helper configures optimal settings that are required\n"
+    "  for sites to load properly.\n"
+    "- Call launch_browser() once, then reuse `page` across calls (state persists).\n"
+    "- Use the async API with top-level await.\n"
+    "- To see what's on a page, you can:\n"
+    "  1. Take a screenshot (returns base64 you can analyze):\n"
+    "     import base64\n"
+    "     screenshot_bytes = await page.screenshot(full_page=False)\n"
+    "     print(base64.b64encode(screenshot_bytes).decode())\n"
+    "  2. Extract text from the DOM:\n"
+    "     text = await page.inner_text('body')\n"
+    "     elements = await page.query_selector_all('css selector')\n"
+    "     for el in elements:\n"
+    "         print(await el.text_content())\n"
+    "  Prefer DOM extraction for structured data. Use screenshots\n"
+    "  when you need to understand visual layout or image content.\n"
+    "- Use CSS selectors and aria attributes to find and interact\n"
+    "  with elements.\n"
+)
+
+# ---------------------------------------------------------------------------
+# Pydantic param schema
+# ---------------------------------------------------------------------------
+
+
+class ExecutePythonParams(BaseModel):
+    code: str = Field(description="Python code to execute")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_input(code: str) -> str:
+    """Strip backticks, whitespace, and 'python' prefix from LLM output."""
+    code = re.sub(r"^(\s|`)*(?i:python)?\s*", "", code)
+    code = re.sub(r"(\s|`)*$", "", code)
+    return code
+
+
+def _build_url(endpoint: str, session_id: str) -> str:
+    base = endpoint.rstrip("/")
+    encoded_id = urllib.parse.quote(session_id)
+    return f"{base}/executions?api-version={_API_VERSION}&identifier={encoded_id}"
+
+
+def _endpoint_host(endpoint: str) -> str:
+    """Return just the host of the pool endpoint (never the full URL, which is non-secret but noisy)."""
+    try:
+        return urllib.parse.urlsplit(endpoint).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _extract_streams(result_json: str) -> tuple[str, str]:
+    """Parse the ``_execute_code`` payload into ``(stdout, stderr)`` for telemetry."""
+    try:
+        parsed = json.loads(result_json)
+    except (TypeError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(parsed, dict):
+        return "", ""
+    stdout = parsed.get("stdout")
+    stderr = parsed.get("stderr")
+    return (
+        stdout if isinstance(stdout, str) else "",
+        stderr if isinstance(stderr, str) else "",
+    )
+
+
+async def _execute_code(
+    endpoint: str,
+    code: str,
+    session_id: str,
+    token_provider: Callable[[], Awaitable[str]],
+    http_session: aiohttp.ClientSession,
+) -> str:
+    """Execute Python code in an ACA dynamic session."""
+    code = _sanitize_input(code)
+    token = await token_provider()
+    url = _build_url(endpoint, session_id)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    # Correlate the ACA-side execution with this Function App operation when a trace is active.
+    operation_id = current_operation_id()
+    if operation_id:
+        headers["operation-id"] = operation_id
+
+    async with http_session.post(
+        url,
+        headers=headers,
+        json={
+            "codeInputType": "Inline",
+            "executionType": "Synchronous",
+            "code": code,
+            "timeoutInSeconds": 60,
+        },
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as response:
+        if response.status >= 400:
+            body = await response.text()
+            raise RuntimeError(f"ACA sessions API error ({response.status}): {body[:500]}")
+        data = await response.json()
+
+    result = data.get("result", {})
+    return json.dumps(
+        {
+            "result": result.get("executionResult"),
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+        },
+        indent=2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Factory: create per-agent execute_python tool
+# ---------------------------------------------------------------------------
+
+# Shared credentials and HTTP session (created lazily, reused across agents).
+# Credentials are keyed by client id because each code-interpreter pool can
+# select a different user-assigned managed identity.
+_credentials: dict[str, DefaultAzureCredential] = {}
+_token_providers: dict[str, Callable[[], Awaitable[str]]] = {}
+_http_session: aiohttp.ClientSession | None = None
+_init_lock = asyncio.Lock()
+
+# Track which ACA sessions have been set up (Playwright helper loaded)
+_setup_sessions: set[tuple[str, str]] = set()
+_setup_lock = asyncio.Lock()
+
+
+async def _ensure_shared_resources(
+    client_id: str | None,
+) -> tuple[Callable[[], Awaitable[str]], aiohttp.ClientSession]:
+    """Lazily create shared credential/token resources for the requested identity."""
+    global _http_session
+    credential_key = client_id or ""
+    token_provider = _token_providers.get(credential_key)
+    if token_provider is not None and _http_session is not None:
+        return token_provider, _http_session
+
+    async with _init_lock:
+        token_provider = _token_providers.get(credential_key)
+        if token_provider is None:
+            credential = (
+                build_async_credential_with_client_id(client_id)
+                if client_id
+                else build_async_credential()
+            )
+            _credentials[credential_key] = credential
+            token_provider = get_bearer_token_provider(
+                credential, "https://dynamicsessions.io/.default"
+            )
+            _token_providers[credential_key] = token_provider
+        if _http_session is None:
+            _http_session = aiohttp.ClientSession()
+        logger.debug(
+            "dynamic_sessions_code_interpreter: shared credential, token provider, "
+            "and HTTP session initialized"
+        )
+        return token_provider, _http_session
+
+
+def create_sandbox_tools(
+    config: dict[str, Any],
+    *,
+    fallback_session_id: str | None = None,
+) -> list[FunctionTool]:
+    """Create an ``execute_python`` tool bound to a specific ACA session pool.
+
+    Parameters
+    ----------
+    config:
+        The ``system_tools.dynamic_sessions_code_interpreter`` block. Must
+        contain ``endpoint``. Optional ``client_id`` selects a user-assigned
+        managed identity for the session pool.
+    fallback_session_id:
+        Used as the ACA session identifier so the REPL state persists across
+        ``execute_python`` calls within the same conversation. The runner
+        passes the resolved agent-runtime session id here. MAF does not
+        currently expose the active session id to tools, so the runner bakes
+        it into the tool closure on every request. When omitted, a fresh GUID
+        is generated so independent invocations do not share a sandbox.
+
+    Returns a list with one tool, or an empty list if the config is invalid.
+    """
+    raw_endpoint = config.get("endpoint", "")
+    if not raw_endpoint:
+        logger.warning("dynamic_sessions_code_interpreter: missing 'endpoint', skipping")
+        return []
+
+    endpoint = substitute_env_vars_in_value(str(raw_endpoint))
+    if not endpoint or has_unresolved_placeholders(endpoint):
+        logger.warning(
+            "dynamic_sessions_code_interpreter: could not resolve endpoint '%s', skipping",
+            raw_endpoint,
+        )
+        return []
+
+    if not _is_allowed_sessions_endpoint(endpoint):
+        logger.warning(
+            "dynamic_sessions_code_interpreter: resolved endpoint '%s' failed validation "
+            "(must be an https URL whose host is *.dynamicsessions.io); "
+            "skipping tool creation",
+            endpoint,
+        )
+        return []
+
+    raw_client_id = config.get("client_id")
+    client_id = None
+    if raw_client_id:
+        resolved_client_id = substitute_env_vars_in_value(str(raw_client_id))
+        if has_unresolved_placeholders(resolved_client_id):
+            logger.warning(
+                "dynamic_sessions_code_interpreter: could not resolve client_id '%s'; "
+                "using the default Azure credential identity",
+                raw_client_id,
+            )
+        else:
+            client_id = resolved_client_id.strip() or None
+
+    aca_session_id = fallback_session_id or uuid.uuid4().hex
+    logger.info(
+        "dynamic_sessions_code_interpreter: creating tool with endpoint %s (aca_session=%s)",
+        endpoint,
+        aca_session_id,
+    )
+
+    @tool(
+        name="execute_python",
+        description=_EXECUTE_PYTHON_DESCRIPTION,
+        schema=ExecutePythonParams,
+    )
+    async def execute_python(params: ExecutePythonParams) -> str:
+        token_provider, http_session = await _ensure_shared_resources(client_id)
+
+        code = params.code or ""
+        if not code.strip():
+            return json.dumps({"error": "No code provided"})
+
+        logger.info(
+            "dynamic_sessions_code_interpreter: executing code in ACA session %s",
+            aca_session_id,
+        )
+
+        operation_id = current_operation_id()
+        with start_span(
+            "dynamic_session.execute",
+            fault_domain=FaultDomain.SANDBOX,
+            lifecycle_stage=LifecycleStage.TOOL_EXECUTION,
+            attributes={
+                "af.dynamic_session.session_id": aca_session_id,
+                "server.address": _endpoint_host(endpoint),
+                "af.dynamic_session.code_bytes": len(code),
+            },
+        ) as span:
+            span.set_attribute(ATTR_OPERATION_ID, operation_id)
+            span.set_content("af.dynamic_session.code", code)
+            try:
+                # Pre-load Playwright helper on first call per session
+                async with _setup_lock:
+                    setup_key = (endpoint, aca_session_id)
+                    session_reused = setup_key in _setup_sessions
+                    if not session_reused:
+                        await _execute_code(
+                            endpoint,
+                            _ACA_SESSION_SETUP,
+                            aca_session_id,
+                            token_provider,
+                            http_session,
+                        )
+                        _setup_sessions.add(setup_key)
+                span.set_attribute("af.dynamic_session.session_reused", session_reused)
+                span.set_attribute("af.dynamic_session.setup_ran", not session_reused)
+
+                result = await _execute_code(
+                    endpoint,
+                    code,
+                    aca_session_id,
+                    token_provider,
+                    http_session,
+                )
+
+                # The tool always returns a string to the model, but a non-empty stderr means the
+                # code failed. Surface that as a span ERROR + failure metric so a "successful" tool
+                # call no longer masks a broken execution (e.g. a missing OCR binary).
+                stdout, stderr = _extract_streams(result)
+                span.set_attribute("af.dynamic_session.stdout_bytes", len(stdout))
+                span.set_attribute("af.dynamic_session.stderr_bytes", len(stderr))
+                span.set_content("af.dynamic_session.stdout", stdout)
+                span.set_content("af.dynamic_session.stderr", stderr)
+
+                has_error = bool(stderr.strip())
+                span.set_attribute("af.dynamic_session.stderr_present", has_error)
+                record_sandbox_execution(error=has_error)
+                if has_error:
+                    span.set_error(
+                        "execute_python produced stderr", fault_domain=FaultDomain.SANDBOX
+                    )
+                    logger.warning(
+                        "dynamic_sessions_code_interpreter: ACA session %s returned stderr "
+                        "(%d bytes)",
+                        aca_session_id,
+                        len(stderr),
+                    )
+                else:
+                    logger.info(
+                        "dynamic_sessions_code_interpreter: ACA session %s completed successfully",
+                        aca_session_id,
+                    )
+                return result
+            except Exception as exc:
+                error_msg = f"{type(exc).__name__}: {exc}"
+                span.record_exception(exc, fault_domain=FaultDomain.SANDBOX)
+                record_sandbox_execution(error=True)
+                logger.error(
+                    "dynamic_sessions_code_interpreter: ACA session %s failed: %s",
+                    aca_session_id,
+                    error_msg,
+                )
+                return json.dumps({"error": error_msg})
+
+    logger.info("dynamic_sessions_code_interpreter: execute_python tool created")
+    return [execute_python]

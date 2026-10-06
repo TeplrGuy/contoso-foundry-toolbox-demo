@@ -1,0 +1,31 @@
+{
+  "servers": {
+    "microsoft-learn": {
+      "type": "http",
+      "url": "https://learn.microsoft.com/api/mcp"
+    },
+    "foundry-toolbox": {
+      "type": "http",
+      "url": "$FOUNDRY_TOOLBOX_MCP_URL",
+      "auth": {
+        "scope": "https://ai.azure.com/.default"
+      }
+    },
+    "foundry-toolbox-flat": {
+      "type": "http",
+      "url": "$FOUNDRY_TOOLBOX_FLAT_MCP_URL",
+      "auth": {
+        "scope": "https://ai.azure.com/.default"
+      }
+    },
+    "office365-outlook": {
+      "type": "http",
+      "url": "$O365_MCP_SERVER_URL",
+      "tools": ["office365_SendEmailV2"],
+      "auth": {
+        "scope": "https://apihub.azure.com/.default",
+        "client_id": "$O365_MCP_CLIENT_ID"
+      }
+    }
+  }
+}

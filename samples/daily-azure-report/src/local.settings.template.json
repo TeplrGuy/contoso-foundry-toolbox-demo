@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "SUBSCRIPTION_ID": "",
+    "O365_MCP_SERVER_URL": "",
+    "O365_MCP_CLIENT_ID": "",
+    "TO_EMAIL": "",
+    "AZURE_FUNCTIONS_AGENTS_PROVIDER": "foundry",
+    "FOUNDRY_PROJECT_ENDPOINT": "",
+    "FOUNDRY_MODEL": "gpt-5.4",
+    "AZURE_FUNCTIONS_AGENTS_REASONING_EFFORT": "high",
+    "AZURE_FUNCTIONS_AGENTS_REASONING_SUMMARY": "concise"
+  }
+}

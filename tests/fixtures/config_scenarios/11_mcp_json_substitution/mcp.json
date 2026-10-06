@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer $GITHUB_MCP_TOKEN",
+        "X-Tenant": "%TENANT_NAME%"
+      },
+      "tools": ["search_issues", "list_pull_requests"]
+    },
+    "internal": {
+      "type": "http",
+      "url": "https://%MCP_LOG_LEVEL%.internal.example.test/$WORKSPACE_ROOT",
+      "headers": {
+        "X-Node": "$NODE_BIN",
+        "X-API-Key": "$UNSET_API_KEY"
+      }
+    }
+  }
+}

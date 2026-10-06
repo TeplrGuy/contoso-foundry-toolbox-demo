@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import inspect
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from functools import wraps
+from typing import Any, TypeVar, cast, overload
+
+from agent_framework import FunctionTool
+from pydantic import BaseModel
+
+import azure_functions_agents as _package
+
+__all__ = [
+    "FunctionTool",
+    "WorkflowTool",
+    "WorkflowToolMetadata",
+    "get_workflow_tool_handler",
+    "get_workflow_tool_metadata",
+    "tool",
+    "workflow_tool",
+]
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+_WORKFLOW_TOOL_METADATA_ATTR = "__azure_functions_agents_workflow_tool__"
+_WORKFLOW_TOOL_HANDLER_ATTR = "__azure_functions_agents_workflow_handler__"
+
+
+@dataclass(frozen=True)
+class WorkflowToolMetadata:
+    """Author-supplied workflow tool metadata attached by ``@workflow_tool``."""
+
+    name: str | None = None
+    description: str | None = None
+    public: bool = True
+    retry: _package.WorkflowRetryPolicy | None = None
+    timeout: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowTool:
+    """Discovered workflow tool declaration ready for registry registration."""
+
+    name: str
+    description: str
+    handler: Callable[..., Any] | None
+    public: bool = True
+    retry: _package.WorkflowRetryPolicy | None = None
+    timeout: str | None = None
+
+
+def get_workflow_tool_metadata(target: object) -> WorkflowToolMetadata | None:
+    metadata = getattr(target, _WORKFLOW_TOOL_METADATA_ATTR, None)
+    if isinstance(metadata, WorkflowToolMetadata):
+        return metadata
+    return None
+
+
+def get_workflow_tool_handler(target: Callable[..., Any]) -> Callable[..., Any]:
+    """Get the dictionary adapter for a schema-wrapped tool."""
+    handler = getattr(target, _WORKFLOW_TOOL_HANDLER_ATTR, None)
+    if callable(handler):
+        return cast("Callable[..., Any]", handler)
+    return target
+
+
+def _wrap_with_schema(  # noqa: UP047
+    func: Callable[[SchemaT], Any],
+    schema: type[SchemaT],
+) -> Callable[..., Awaitable[Any]]:
+    @wraps(func)
+    async def wrapper(**kwargs: Any) -> Any:
+        params = schema(**kwargs)
+        result = func(params)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def workflow_handler(args: dict[str, Any]) -> Any:
+        return func(schema(**args))
+
+    async def async_workflow_handler(args: dict[str, Any]) -> Any:
+        return await wrapper(**args)
+
+    setattr(
+        wrapper,
+        _WORKFLOW_TOOL_HANDLER_ATTR,
+        async_workflow_handler if inspect.iscoroutinefunction(func) else workflow_handler,
+    )
+    return wrapper
+
+
+@overload
+def tool(
+    func: Callable[..., Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    schema: None = None,
+    **kwargs: Any,
+) -> FunctionTool: ...
+
+
+@overload
+def tool(  # noqa: UP047
+    func: Callable[[SchemaT], Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    schema: type[SchemaT],
+    **kwargs: Any,
+) -> FunctionTool: ...
+
+
+@overload
+def tool(
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    schema: None = None,
+    **kwargs: Any,
+) -> Callable[[Callable[..., Any]], FunctionTool]: ...
+
+
+@overload
+def tool(  # noqa: UP047
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    schema: type[SchemaT],
+    **kwargs: Any,
+) -> Callable[[Callable[[SchemaT], Any]], FunctionTool]: ...
+
+
+def tool(
+    func: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    schema: type[BaseModel] | None = None,
+    **kwargs: Any,
+) -> FunctionTool | Callable[[Callable[..., Any]], FunctionTool]:
+    def decorator(inner: Callable[..., Any]) -> FunctionTool:
+        wrapped: Callable[..., Any] = inner
+        input_model: type[BaseModel] | None = None
+        if schema is not None:
+            wrapped = _wrap_with_schema(inner, schema)
+            input_model = schema
+        return FunctionTool(
+            name=name or inner.__name__,
+            description=(description or inner.__doc__ or "").strip(),
+            func=wrapped,
+            input_model=input_model,
+            **kwargs,
+        )
+
+    if func is not None:
+        return decorator(func)
+    return decorator
+
+
+@overload
+def workflow_tool[DecoratedT](
+    func: DecoratedT,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    public: bool = True,
+    retry: _package.WorkflowRetryPolicy | None = None,
+    timeout: str | None = None,
+    **kwargs: Any,
+) -> DecoratedT: ...
+
+
+@overload
+def workflow_tool[DecoratedT](
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    public: bool = True,
+    retry: _package.WorkflowRetryPolicy | None = None,
+    timeout: str | None = None,
+    **kwargs: Any,
+) -> Callable[[DecoratedT], DecoratedT]: ...
+
+
+def workflow_tool[DecoratedT](
+    func: DecoratedT | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    public: bool = True,
+    retry: _package.WorkflowRetryPolicy | None = None,
+    timeout: str | None = None,
+    **kwargs: Any,
+) -> DecoratedT | Callable[[DecoratedT], DecoratedT]:
+    """Mark a ``tools/`` callable as a Dynamic Workflow tool.
+
+    The decorator records metadata and returns the original object so it does not
+    make the callable a normal MAF ``FunctionTool`` unless ``@tool`` is also used.
+    """
+    if kwargs:
+        unknown = ", ".join(sorted(kwargs))
+        raise TypeError(f"unknown workflow_tool argument(s): {unknown}")
+
+    from .workflows.schema import WorkflowRetryPolicy, workflow_timeout_ms
+
+    if retry is not None and not isinstance(retry, WorkflowRetryPolicy):
+        raise TypeError("workflow_tool retry must be a WorkflowRetryPolicy")
+    if timeout is not None:
+        try:
+            workflow_timeout_ms(timeout)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(f"workflow_tool timeout is invalid: {exc}") from exc
+    metadata = WorkflowToolMetadata(
+        name=name,
+        description=description,
+        public=public,
+        retry=retry,
+        timeout=timeout,
+    )
+
+    def decorator(inner: DecoratedT) -> DecoratedT:
+        if not callable(inner) and not isinstance(inner, FunctionTool):
+            raise TypeError("@workflow_tool can only decorate a callable or FunctionTool")
+        setattr(inner, _WORKFLOW_TOOL_METADATA_ATTR, metadata)
+        return inner
+
+    if func is not None:
+        return decorator(func)
+    return decorator

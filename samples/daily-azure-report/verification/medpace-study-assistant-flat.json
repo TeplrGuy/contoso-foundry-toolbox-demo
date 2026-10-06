@@ -1,0 +1,86 @@
+{
+  "verified_at": "2026-10-06T02:39:00Z",
+  "tenant_id": "d11cdc76-c6f2-4368-a98f-498e78a7e011",
+  "subscription_id": "8fcc5e8e-6540-4288-89e7-849e94290205",
+  "agent_get": {
+    "id": "medpace-study-assistant-flat",
+    "state": "enabled",
+    "configuration_state": "enabled",
+    "latest_version": {
+      "version": "1",
+      "status": "active",
+      "definition": {
+        "kind": "prompt",
+        "model": "gpt-5.4",
+        "tools": [
+          {
+            "type": "mcp",
+            "server_label": "medpace-study-toolbox-flat",
+            "server_url": "https://cog-hbcyongnalrgq.services.ai.azure.com/api/projects/cog-hbcyongnalrgq-proj/toolboxes/medpace-study-toolbox-flat/mcp?api-version=v1",
+            "require_approval": "never"
+          }
+        ]
+      },
+      "instance_identity": {
+        "principal_id": "2aba8f9e-bafa-48c2-a23c-7972efc5ec15"
+      }
+    },
+    "endpoint": {
+      "protocols": [
+        "responses"
+      ],
+      "authorization_schemes": [
+        {
+          "type": "Entra"
+        }
+      ]
+    }
+  },
+  "role_assignments": [
+    {
+      "role": "Foundry User",
+      "resource": "cog-hbcyongnalrgq-proj"
+    },
+    {
+      "role": "Search Index Data Reader",
+      "resource": "srch-medpace-hbcyongnalrgq"
+    }
+  ],
+  "flat_toolbox_tools_list": {
+    "count": 10,
+    "serialized_schema_bytes": 12797,
+    "names": [
+      "medpace_ops___filler_ctms_site_activation",
+      "medpace_ops___filler_edc_query_manager",
+      "medpace_ops___filler_enrollment_forecast",
+      "medpace_ops___filler_ivrs_randomization",
+      "medpace_ops___filler_lab_reconciliation",
+      "medpace_ops___filler_monitoring_visit",
+      "medpace_ops___filler_safety_narrative",
+      "medpace_ops___filler_tmf_indexer",
+      "medpace_ops___main",
+      "study-doc-search"
+    ],
+    "contains_tool_search": false,
+    "contains_call_tool": false
+  },
+  "verification_response": {
+    "id": "resp_0acb40b838d16ba2006ac45f39c8c0819791591acba87f93aa",
+    "status": "completed",
+    "mcp_list_tools_server": "medpace-study-toolbox-flat",
+    "mcp_call": {
+      "server_label": "medpace-study-toolbox-flat",
+      "name": "study-doc-search"
+    },
+    "answer": "Before a protocol deviation can be classified as important, the study team must document the visit at which the deviation occurred, the specific protocol section that was deviated from, the impact of the deviation on subject safety and data integrity, and the investigator acknowledgement of the deviation. All four elements must be recorded before the deviation is classified as important. Source: SOP-QA-014, Section 4.2. Provenance: PD-CANARY-4419",
+    "contains_canary": true,
+    "usage": {
+      "input_tokens": 2259,
+      "cached_tokens": 1024,
+      "cache_write_tokens": 0,
+      "output_tokens": 154,
+      "reasoning_tokens": 0,
+      "total_tokens": 2413
+    }
+  }
+}

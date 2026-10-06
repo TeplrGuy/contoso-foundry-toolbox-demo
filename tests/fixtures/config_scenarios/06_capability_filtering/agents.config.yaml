@@ -1,0 +1,11 @@
+model: gpt-4o
+timeout: 900
+
+tools:
+  exclude:
+    - bash
+    - execute_shell
+
+system_tools:
+  dynamic_sessions_code_interpreter:
+    endpoint: https://pool.example.test

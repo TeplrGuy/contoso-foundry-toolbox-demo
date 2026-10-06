@@ -1,0 +1,4 @@
+# Cloud deploy pins the published runtime (same version as this repo's source tree).
+# For local development against the repo source, use: pip install -e ../../..[monitor]
+azurefunctions-agents-runtime[monitor]==0.1.0b16
+jmespath

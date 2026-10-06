@@ -1,0 +1,7 @@
+# Global defaults shared by every agent in this app.
+model: gpt-4o
+timeout: 900
+
+system_tools:
+  dynamic_sessions_code_interpreter:
+    endpoint: https://pool.example.test
