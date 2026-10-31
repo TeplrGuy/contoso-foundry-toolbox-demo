@@ -29,7 +29,7 @@
     "pack:check": "npm run build && npm pack --dry-run"
   },
   "dependencies": {
-    "@azure/identity": "4.13.3",
+    "@azure/identity": "4.14.1",
     "@microsoft/vally": "0.16.0"
   },
   "devDependencies": {
